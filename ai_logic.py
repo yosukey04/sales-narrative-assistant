@@ -1,7 +1,8 @@
 import os
+import json
+from dotenv import load_dotenv
 from openai import OpenAI
 from tavily import TavilyClient
-from dotenv import load_dotenv
 
 # 環境変数の読み込み
 load_dotenv()
@@ -14,27 +15,23 @@ def get_tavily_client():
 
 # ベースとなるシステムプロンプト
 SYSTEM_PROMPT_TEMPLATE = """
-あなたは人見知りの1人社長を支える、世界で唯一の「絶対的な味方」であるAI秘書です。
-以下のルールを絶対に守ってください。
+あなたは、1人社長に寄り添う「絶対的な味方」としての営業ナラティブ・アシスタントです。
+彼らは素晴らしい価値を持っていますが、売込みやアピールが苦手で「人見知り」です。
+営業は「奪い合い（競争）」ではなく「持っている価値の提供である」という信念のもと、
+社長自身が無理せず、自然体で魅力が伝わるようなアドバイスや視点を提供してください。
 
-1. ユーザーを否定せず、自己肯定感を高める温かく励ますトーンで会話してください。
-2. 営業を「奪い合い」ではなく「相手への価値の提供と貢献」と定義してください。
-3. ユーザーのプロフィール情報を常に参照し、内容に沿ったパーソナライズされた回答をしてください。
-4. AIであるあなたからは絶対に特定の契約・有料サービス（CNO契約等）への勧誘を行わないでください。ユーザーの純粋な成功を願ってください。
-
----
-【ユーザーのプロフィール情報】
+【ユーザー情報（社長のプロファイル）】
 名前: {user_name}
-事業内容・サービス詳細: {biz_profile}
-ターゲット（理想の顧客像）: {target_persona}
-独自の強み・選ばれる理由・実績: {unique_value}
-仕事にかける想い・理念: {vision_story}
+事業内容: {biz_profile}
+ターゲット: {target_persona}
+独自の強み: {unique_value}
+ビジョン: {vision_story}
 """
 
 def get_system_prompt(user_data):
-    """ユーザーデータをマージしたシステムプロンプトを生成"""
+    """ユーザープロファイルを埋め込んだシステムプロンプトを生成"""
     return SYSTEM_PROMPT_TEMPLATE.format(
-        user_name=user_data.get("user_name", "未設定"),
+        user_name=user_data.get("user_name", "社長"),
         biz_profile=user_data.get("biz_profile", "未設定"),
         target_persona=user_data.get("target_persona", "未設定"),
         unique_value=user_data.get("unique_value", "未設定"),
@@ -44,63 +41,95 @@ def get_system_prompt(user_data):
 def scout_target(user_data, target_person):
     """A. 10秒スカウター（相手リサーチ）実行ロジック"""
     try:
-        client = get_tavily_client()
-        search_result = client.search(query=target_person, search_depth="basic")
+        tavily = get_tavily_client()
+        # 1. Tavily APIで検索
+        search_result = tavily.search(query=target_person, search_depth="basic")
         
         # 検索結果を文字列にまとめる
         context_text = "\n".join([f"- {res['title']}: {res['content']}" for res in search_result.get("results", [])])
-        if not context_text:
-            context_text = "有益な検索結果が見つかりませんでした。"
-            
-    except Exception as e:
-        context_text = f"検索中にエラーが発生しました: {str(e)}"
-    
-    # 2. OpenAIで要約し、質問案を生成
-    messages = [
-        {"role": "system", "content": get_system_prompt(user_data)},
-        {"role": "user", "content": f"以下の人物・企業「{target_person}」に関する最新の検索情報を元に、ユーザー（1人社長）がどのように相手に「貢献」できるかという視点で話を広げるための『話のきっかけ（質問案）』を2〜3つ生成してください。売り込みではなく、相手への関心と貢献を重視してください。\n\n【検索結果】\n{context_text}"}
-    ]
-    
-    try:
-        response = openai_client.chat.completions.create(
+        
+        # 2. OpenAIでプロンプト生成
+        openai = get_openai_client()
+        system_prompt = get_system_prompt(user_data)
+        instruction = f"""
+以下の検索結果をもとに、この相手({target_person})に対して「私（社長）が貢献できそうな接点・話のきっかけ」を3つ提案してください。
+社長が自分から売り込むのではなく、相手の関心事にどう寄り添えるかという視点で書いてください。
+
+【検索結果】
+{context_text}
+"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": instruction}
+        ]
+        
+        response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             temperature=0.7
         )
         return response.choices[0].message.content
+        
     except Exception as e:
         return f"AIレスポンス生成中にエラーが発生しました: {str(e)}\nAPIキーが正しく設定されていない可能性があります。"
 
 def generate_strategy(user_data, event_info):
-    """B. 立ち回り指令書（イベント戦略）生成ロジック"""
-    messages = [
-        {"role": "system", "content": get_system_prompt(user_data)},
-        {"role": "user", "content": f"以下のイベント・交流会の概要を元に、人見知りのユーザーに対して「今日誰と話すべきか」「自分のどの強みを強調すべきか」を提示する指令書を作成してください。具体的で、心理的ハードルが低い（実行しやすい）アクションプランを提示し、最後は温かく励ましてください。\n\n【イベント情報】\n{event_info}"}
-    ]
-    
+    """B. 立ち回り指令書 実行ロジック"""
     try:
-        response = openai_client.chat.completions.create(
+        openai = get_openai_client()
+        system_prompt = get_system_prompt(user_data)
+        instruction = f"""
+以下のイベント概要に参加する予定です。
+私（人見知りで売り込みが苦手）が、無理せず自然体で振る舞え、かつ私の強みが伝わるような具体的なアクションプラン（立ち回り指令書）をステップバイステップで作成してください。
+
+【イベント概要】
+{event_info}
+"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": instruction}
+        ]
+        
+        response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             temperature=0.7
         )
         return response.choices[0].message.content
+        
     except Exception as e:
-        return f"AIレスポンス生成中にエラーが発生しました: {str(e)}"
+        return f"AIレスポンス生成中にエラーが発生しました: {str(e)}\nAPIキーが正しく設定されていない可能性があります。"
 
 def review_meeting(user_data, transcript):
-    """C. 商談採点・反省会（文字起こし分析）ロジック"""
-    messages = [
-        {"role": "system", "content": get_system_prompt(user_data)},
-        {"role": "user", "content": f"以下の商談（交流会）の文字起こしを読み、以下の5項目（各20点満点、合計100点）で厳しくも温かく採点してください。\n1. 傾聴力、2. 共感、3. ベネフィット提示、4. クロージング、5. ナラティブ（一貫性）。\n\nまた、ユーザーがどれくらい話していたかの「トーク比率（ユーザー：相手）」の推計値、良かった点、具体的な改善案を提示してください。\n※コンセプトの言語化が不足していると判断した場合のみ、「ナラティブの言語化を深めることで、より伝わりやすくなります」という事実の伝達のみを含めてください。あなたから有料サービスの案内などは絶対にしないでください。\n\n【文字起こし】\n{transcript}"}
-    ]
-    
+    """C. 商談採点・反省会 実行ロジック"""
     try:
-        response = openai_client.chat.completions.create(
+        openai = get_openai_client()
+        system_prompt = get_system_prompt(user_data)
+        instruction = f"""
+以下の商談（交流会）の会話文字起こしを読み、以下の5つの観点で5点満点で採点し、良かった点と改善点（無理のない提案）をフィードバックしてください。
+また、おおよそのトーク比率（こちら側〇〇%、相手側〇〇%）も推定して提示してください。
+
+【採点項目】
+1. 聞き出し力（相手の課題を引き出せたか）
+2. 共感・寄り添い（売り込みにならず同調できたか）
+3. 提供価値の提示（自社の強みを自然に伝えられたか）
+4. ストーリー性（ビジョンや想いに一貫性があったか）
+5. 次ステップ設定（自然な形で次の約束へ繋げられたか）
+
+【文字起こし】
+{transcript}
+"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": instruction}
+        ]
+        
+        response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             temperature=0.7
         )
         return response.choices[0].message.content
+        
     except Exception as e:
-        return f"AIレスポンス生成中にエラーが発生しました: {str(e)}"
+        return f"AIレスポンス生成中にエラーが発生しました: {str(e)}\nAPIキーが正しく設定されていない可能性があります。"
